@@ -1,0 +1,799 @@
+#!/bin/bash
+
+# Předmět: IOS
+# Projekt 1: Corona
+# Author: Vítězslav Šafář (xsafar26)
+# Datum: 20.3.2022
+
+help(){
+    echo '--------------------------------Corona-Help--------------------------------'
+    echo 'Použití:'
+    echo 'corona [-h] [FILTERS] [COMMAND] [LOG [LOG2 [...]]'
+    echo '------------------------------------------------------------------------------'
+    echo 'Commands:'
+    echo 'infected — spočítá počet nakažených'
+    echo 'merge — sloučí několik souborů se záznamy do jednoho, zachovávající původní' 
+    echo '        pořadí (hlavička bude ve výstupu jen jednou)'
+    echo 'gender — vypíše počet nakažených pro jednotlivá pohlaví'
+    echo 'age — vypíše statistiku počtu nakažených osob dle věku (bližší popis je níže)'
+    echo 'daily — vypíše statistiku nakažených osob pro jednotlivé dny'
+    echo 'monthly — vypíše statistiku nakažených osob pro jednotlivé měsíce'
+    echo 'yearly — vypíše statistiku nakažených osob pro jednotlivé roky'
+    echo 'countries — vypíše statistiku nakažených osob pro jednotlivé země nákazy'
+    echo '            (bez ČR, tj. kódu CZ)'
+    echo 'districts — vypíše statistiku nakažených osob pro jednotlivé okresy'
+    echo 'regions — vypíše statistiku nakažených osob pro jednotlivé kraje'
+    echo '------------------------------------------------------------------------------'
+    echo 'Filters:'
+    echo '-a DATETIME — after: jsou uvažovány pouze záznamy PO tomto datu'
+    echo '              (včetně tohoto data). DATETIME je formátu YYYY-MM-DD'
+    echo '-b DATETIME — before: jsou uvažovány pouze záznamy PŘED tímto datem'
+    echo '              (včetně tohoto data). DATETIME je formátu YYYY-MM-DD'
+    echo '-g GENDER — jsou uvažovány pouze záznamy nakažených osob daného pohlaví'
+    echo '            GENDER může být M (muži) nebo Z (ženy)'
+    echo '-s [WIDTH] — u příkazů gender, age, daily, monthly, yearly, countries,'
+    echo '             districts a regions vypisuje data ne číselně, ale graficky' 
+    echo '             v podobě histogramů. Nepovinný parametr WIDTH nastavuje šířku'
+    echo '             histogramů, tedy délku nejdelšího řádku, na WIDTH. Tedy, WIDTH'
+    echo '             musí být kladné celé číslo. Pokud není parametr WIDTH uveden,'
+    echo '             řídí se šířky řádků požadavky uvedenými níže'
+}
+gender=""
+before=""
+after=""
+width="0"
+daytime=""
+command=""
+stacked_logs=""
+numReg='^[0-9]+$'
+dateReg='^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+filter=""
+AgeError=""
+logs=""
+header="id,datum,vek,pohlavi,kraj_nuts_kod,okres_lau_kod,nakaza_v_zahranici,nakaza_zeme_csu_kod,reportovano_khs"
+fileArgument=""
+((OPTIND--))
+shift $OPTIND
+
+while [ "$#" -ne 0 ]; do # "$#" ... počet argumentů
+case "$1" in
+#Nápověda
+    -h)
+    help
+    exit
+    ;;
+#Filter
+    -a)
+    shift;
+    if [ -z $after ]; then
+        #TODO zkontrolovat správnost vstupního data
+        if [[ $1 =~ $dateReg ]] && date "+%Y-%m-%d" -d "$1" > /dev/null 2> /dev/null; then
+            after="$1"
+        else
+            echo "Přepínač after $1 není ve správném formátu (YYYY-MM-DD) nebo není validní datum" 1>&2
+            exit 1
+        fi
+        
+    else
+        echo 'Každý filtr může být zadán pouze jednou' 1>&2
+        exit 1
+    fi
+    ;;
+    -b)
+    shift;
+    if [ -z $before ]; then
+    #TODO zkontrolovat správnost vstupního data
+        if [[ $1 =~ $dateReg ]] && date "+%Y-%m-%d" -d "$1"  > /dev/null 2> /dev/null; then
+            before="$1"
+        else
+            echo "Přepínač before $1 není ve správném formátu (YYYY-MM-DD) nebo není validní datum" 1>&2
+            exit 1
+        fi
+    else
+        echo 'Každý filtr může být zadán pouze jednou' 1>&2
+        exit 1
+    fi
+    ;;
+    -g)
+    shift;
+    if [ -z $gender ]; then
+    gender="$1"
+    else
+    echo 'Každý filtr může být zadán pouze jednou' 1>&2
+    exit 1
+    fi
+    ;;
+    -s)
+    if ! [ -z "$2" ]; then
+        if [ "$width" -eq 0 ]; then
+            if [[ $2 =~ $numReg ]]; then
+                if [ "$2" -gt 0 ]; then 
+                    width=$2;
+                    shift;
+                else
+                echo 'Width musí být kladné číslo' 1>&2
+                exit 1;
+                fi
+            else
+            width="-1"
+            fi
+        else
+        echo 'Každý filtr může být zadán pouze jednou' 1>&2
+        exit 1;
+        fi
+    else
+    $width="-1"    
+    fi
+    ;;
+    #Commands
+    infected | merge | gender | age | daily | monthly | yearly | countries | districts | regions)
+    if [ -z $command ]; then
+    command="$1"
+    else
+    echo 'Command může být zadán pouze jeden' 1>&2
+    exit 1
+    fi
+    ;;
+    *.gz) 
+    if ! test -f $1 ; then
+        echo "Neexistující soubor" 1>&2
+        exit 1
+    fi
+    if test -s $1 ; then
+        if [ -z "$logs" ]; then
+            logs="gunzip -c $1"
+        else
+            logs="$logs ; gunzip -c $1"
+        fi
+    else
+    fileArgument="true";
+    fi
+    ;;
+    *.bz2)
+    if ! test -f $1 ; then
+        echo "Neexistující soubor" 1>&2
+        exit 1
+    fi
+    if test -s $1 ; then 
+        if [ -z "$logs" ]; then
+            logs="bzcat $1"
+        else
+            logs="$logs ; bzcat $1" #smaže první řádek u všech souborů :(
+        fi
+    else
+    fileArgument= "true";
+    fi
+    ;;
+    *.csv)
+    if ! test -f $1 ; then
+        echo "Neexistující soubor" 1>&2
+        exit 1
+    fi
+    if test -s "$1" ; then
+        if [ -z "$logs" ]; then
+            logs="cat $1"
+        else
+            logs="$logs ; cat $1"
+        fi
+    else
+    fileArgument="true";
+    fi
+    ;;
+    *)
+    echo 'Neznámý command' 1>&2
+    exit 1
+    ;;
+    esac
+    shift # přesune argumenty do leva a sníží počet argumentů o 1
+done
+
+if [ -z "$logs" -a "$fileArgument" == "" ]; then
+    logs="cat /dev/stdin"
+fi
+if [ -z "$logs" ]; then
+    echo "$header"
+    exit
+fi
+
+stacked_logs='eval $logs'
+
+if [ -n "$stacked_logs" ]; then
+    stacked_logs="$stacked_logs | sed '/'\$header'/d'" #vymaze hlavicku v kazdem souboru
+    if [ "$command" != "merge" -a -n "$command" ]; then
+        stacked_logs="$stacked_logs | sed '/^[[:space:]]*$/d' | sed -E 's/(^|,)[[:blank:]]+/\1/g; s/[[:blank:]]+(,|$)/\1/g'"
+    fi
+fi
+
+#Validace záznamů
+stacked_logs="$stacked_logs | awk -F',' '
+{
+    if((\$3 ~ /^[0-9]+$/ && \$3 >= 0)|| \$3 == \"\"){
+        if(\$2 == \"\"){
+            print
+        }else if(\$2 ~ /^([0-9]{4})-(0[1-9]|1[0-2])-(0[1-9]|[1-2][0-9]|3[0-1])$/){
+            a = substr(\$2, 6, 7);
+            if(a ~ /^02/){
+                b = substr(\$2, 9, 10)
+                    if(b > 29){
+                         printf (\"%s%s\\n\", \"Invalid date: \", \$0) >> \"/dev/stderr\";
+                    }else if(b ~ /^29/){
+                        c = substr(\$2, 1, 4);
+                        if((c % 4 ~ 0 && c % 100 !~ 0)|| c % 400 ~ 0){
+                            print
+                        }else{
+                           printf (\"%s%s\\n\", \"Invalid date: \", \$0) >> \"/dev/stderr\"; 
+                        }
+                    }else{
+                        print 
+                    }
+            }else if((a ~ /^04/) || (a ~ /^06/) || (a ~ /^09/) || (a ~ /^11/)){
+                b = substr(\$2, 9, 10)
+                if(b < 31){
+                    print
+                }else{
+                    printf (\"%s%s\\n\", \"Invalid date: \", \$0)>> \"/dev/stderr\"; 
+                }   
+            }else{
+                print
+            }
+        }else{
+            printf (\"%s%s\\n\", \"Invalid date: \", \$0) >> \"/dev/stderr\"; 
+        }
+    }else{
+        printf (\"%s%s\\n\", \"Invalid age: \", \$0) >> \"/dev/stderr\";
+    }
+}'" 
+#Filters:
+if [ -n "$after" ]; then
+    #TODO vyfiltrování podle data uloženého v $after
+    stacked_logs="$stacked_logs | awk -F',' '\$2 >= \"$after\"'"
+fi
+
+if [ -n "$before" ]; then
+    #TODO vyfiltrování podle data uloženého v $before
+    stacked_logs="$stacked_logs | awk -F',' '\$2 <= \"$before\"'"
+fi
+
+if [ -n "$gender" ]; then
+    #TODO vyfiltrování podle pohlaví uloženého v $gender
+    stacked_logs="$stacked_logs | awk -F',' '\$4 == \"$gender\"'"
+fi
+
+#Commands:
+case "$command" in
+    infected) 
+        stacked_logs="$stacked_logs | wc -l"
+    ;;
+    gender)
+        stacked_logs="$stacked_logs | awk -F ',' \"-vwidth=\$width}\" '
+        {   
+            if(\$4 == \"M\"){
+                countM++; 
+            }else if(\$4 == \"Z\"){
+                countZ++;
+            }else{
+                countN++;
+            }  
+        } 
+        END {
+            if(width ~ /^0/){
+                printf \"%s%d\\n\", \"M: \", countM;
+                printf \"%s%d\\n\", \"Z: \", countZ;
+                if(countN>0){
+                    printf \"%s%d\\n\", \"None: \", countN;
+                }
+            }else{
+                if(width ~ /^-1/){
+                    max=100000;
+                    width = 1;
+                }else{
+                    if(countM > countZ){
+                        max = countM;
+                    }else{
+                        max = countZ;
+                    }
+                    if(countN > max){
+                        max = countN;
+                    }
+                }
+                radek=sprintf(\"%\"int(countM*width/max)\"s\",\"\");
+                gsub(\" \", \"#\", radek);
+                print \"M: \" radek;
+                radek=sprintf(\"%\"int(countZ*width/max)\"s\",\"\");
+                gsub(\" \", \"#\", radek);
+                print \"Z: \" radek;
+                if(countN>0){
+                    radek=sprintf(\"%\"int(countN*width/max)\"s\",\"\");
+                    gsub(\" \", \"#\", radek);
+                    print \"None: \" radek;
+                }   
+            }
+        }'"
+    ;;
+    age) 
+    stacked_logs="$stacked_logs | sort -t, -k3 | awk -F ',' \"-vwidth=\$width}\" '
+        BEGIN{
+            age[0]=\"0-5   : \"
+            age[1]=\"6-15  : \"
+            age[2]=\"16-25 : \"
+            age[3]=\"26-35 : \"
+            age[4]=\"36-45 : \"
+            age[5]=\"46-55 : \"
+            age[6]=\"56-65 : \"
+            age[7]=\"66-75 : \"
+            age[8]=\"76-85 : \"
+            age[9]=\"86-95 : \"
+            age[10]=\"96-105: \"
+            age[11]=\">105  : \"
+            }{   
+            if(\$3 <= 5 && \$3 >= 0){
+                count[0]++;
+            }else if(\$3 <= 15 && \$3 > 5){
+                count[1]++;
+            }else if(\$3 <= 25 && \$3 > 15){
+                count[2]++;
+            }else if(\$3 <= 35 && \$3 > 25){
+                count[3]++;
+            }else if(\$3 <= 45 && \$3 > 35){
+                count[4]++;
+            }else if(\$3 <= 55 && \$3 > 45){
+                count[5]++;   
+            }else if(\$3 <= 65 && \$3 > 55){
+                count[6]++;
+            }else if(\$3 <= 75 && \$3 > 65){
+                count[7]++;
+            }else if(\$3 <= 85 && \$3 > 75){
+                count[8]++;
+            }else if(\$3 <= 95 && \$3 > 85){
+                count[9]++;
+            }else if(\$3 <= 105 && \$3 > 95){
+                count[10]++;
+            }else if(\$3 > 105){
+                count[11]++;
+            }else{
+                count[12]++;
+            }
+        } END {
+            if(width ~ /^0/){
+                for(i=0; i < 12; i++){
+                    printf \"%s%d\\n\", age[i], count[i];
+                }
+                if(count[12]>0){
+                    printf \"%s%d\\n\", \"None  : \", count[12]
+                } 
+            }else{
+                if(width ~ /^-1/){
+                    max=10000;
+                    width = 1;
+                }else{
+                    max = 0;
+                    for(i = 0; i < 13; i++){
+                        if(count[i]>max){
+                            max = count[i];
+                        }
+                    }
+                }
+                for(i = 0; i < 12; i++){
+                    radek=sprintf(\"%\"int(count[i] * width/max)\"s\",\"\");
+                    gsub(\" \", \"#\", radek);
+                    print age[i] radek;
+                }
+                if(count[12]>0){
+                    radek=sprintf(\"%\"int(count[12] * width/max)\"s\",\"\");
+                    gsub(\" \", \"#\", radek);
+                    print \"None  : \" radek;
+                }    
+            }
+        }'"
+    ;;
+    daily)
+    stacked_logs="$stacked_logs | sort -t, -k2 | awk -F ',' \"-vwidth=\$width}\" \"-vi=0\" '
+        {   
+            if(tmp == \$2){
+                count++;
+            }else{
+                if(tmp != \"\"){
+                    if(width ~ /^0/){
+                        printf \"%s%s%d\\n\",  tmp,\": \" , count+1;
+                        i++;
+                    }else{
+                        day[i]=tmp
+                        counts[i]=count+1;
+                        i++;
+                    }
+                }else{
+                    countN = count
+                }
+                tmp = \$2;
+                count = 0;
+            }  
+        }END{
+            if(width ~ /^0/){
+                if(tmp!=\"\"){
+                    printf \"%s%s%d\\n\",  tmp,\": \" , count+1;
+                }else if(i>0){
+                    countN += count+1;
+                }else{
+                    countN +=count;
+                }
+                if(countN > 0){
+                    printf \"%s%d\\n\",  \"None: \" , countN;
+                }
+            }else{
+                if(tmp!=\"\"){
+                    day[i]=tmp
+                    counts[i]=count+1;
+                    i++;
+                }else if(i>0){
+                    countN += count+1;
+                }else{
+                    countN +=count;
+                }
+                if(width ~ /^-1/){
+                    max=500;
+                    width = 1;
+                }else{
+                    max = 0;
+                    for(j = 0; j < i; j++){
+                        if(counts[j]>max){
+                            max = counts[j];
+                        }
+                    }
+                    if(countN > max){
+                        max = countN;
+                    }
+                }
+                for(t=0; t < i; t++){
+                    radek=sprintf(\"%\"int(counts[t]*width/max)\"s\",\"\");
+                    gsub(\" \", \"#\", radek);
+                    print day[t] \": \" radek;
+                }
+                if(countN > 0){
+                    radek=sprintf(\"%\"int(countN*width/max)\"s\",\"\");
+                    gsub(\" \", \"#\", radek);
+                    print \"None: \" radek;
+                }
+            }
+        }'"
+    ;;
+    monthly)
+    stacked_logs="$stacked_logs | sort -t, -k2 | awk -F ',' -vOFS=',' \"-vwidth=\$width}\" \"-vi=0\" '
+        {  
+            \$2=substr(\$2,1,7)
+            if(tmp == \$2){
+                count++;
+            }else{
+                if(tmp != \"\"){
+                    if(width ~ /^0/){
+                        printf \"%s%s%d\\n\",  tmp,\": \" , count+1;
+                        i++;
+                    }else{
+                        month[i]=tmp
+                        counts[i]=count+1;
+                        i++;
+                    }
+                }else{
+                    countN = count
+                }
+                tmp = \$2;
+                count = 0;
+            }       
+        }END{
+            if(width ~ /^0/){
+                if(tmp!=\"\"){
+                    printf \"%s%s%d\\n\",  tmp,\": \" , count+1;
+                }else if(i>0){
+                    countN += count+1;
+                }else{
+                    countN +=count;
+                }
+                if(countN > 0){
+                    printf \"%s%d\\n\",  \"None: \" , countN;
+                }
+            }else{
+                if(tmp!=\"\"){
+                    month[i]=tmp
+                    counts[i]=count+1;
+                    i++;
+                }else if(i>0){
+                    countN += count+1;
+                }else{
+                    countN +=count;
+                }
+                if(width ~ /^-1/){
+                    max = 10000;
+                    width = 1;
+                }else{
+                    max = 0;
+                    for(j = 0; j < i; j++){
+                        if(counts[j]>max){
+                            max = counts[j];
+                        }
+                    }
+                    if(countN > max){
+                        max = countN;
+                    }
+                }
+                for(t=0; t < i; t++){
+                    radek=sprintf(\"%\"int(counts[t]*width/max)\"s\",\"\");
+                    gsub(\" \", \"#\", radek);
+                    print month[t] \": \" radek;
+                }
+                if(countN > 0){
+                    radek=sprintf(\"%\"int(countN*width/max)\"s\",\"\");
+                    gsub(\" \", \"#\", radek);
+                    print \"None: \" radek;
+                }
+            } 
+        }'"
+    ;;
+    yearly)
+    stacked_logs="$stacked_logs | sort -t, -k2 | awk -F ',' -vOFS=',' \"-vwidth=\$width}\" \"-vi=0\" '
+        {   
+            \$2=substr(\$2,1,4)
+            if(tmp == \$2){
+                count++;
+            }else{
+                if(tmp != \"\"){
+                    if(width ~ /^0/){
+                        printf \"%s%s%d\\n\",  tmp,\": \" , count+1;
+                        i++;
+                    }else{
+                        year[i]=tmp
+                        counts[i]=count+1;
+                        i++;
+                    }
+                }else{
+                    countN = count
+                }
+                tmp = \$2;
+                count = 0
+            }    
+        }END{
+            if(width ~ /^0/){
+                if(tmp!=\"\"){
+                    printf \"%s%s%d\\n\",  tmp,\": \" , count+1;
+                }else if(i>0){
+                    countN += count+1;
+                }else{
+                    countN +=count;
+                }
+                if(countN > 0){
+                    printf \"%s%d\\n\",  \"None: \" , countN;
+                }
+            }else{
+                if(tmp!=\"\"){
+                    year[i]=tmp
+                    counts[i]=count+1;
+                    i++;
+                }else if(i>0){
+                    countN += count+1;
+                }else{
+                    countN +=count;
+                }
+                if(width ~ /^-1/){
+                    max=100000;
+                    width = 1;
+                }else{
+                    max = 0;
+                    for(j = 0; j < i; j++){
+                        if(counts[j]>max){
+                            max = counts[j];
+                        }
+                    }
+                    if(countN > max){
+                        max = countN;
+                    }
+                }
+                for(t=0; t < i; t++){
+                    radek=sprintf(\"%\"int(counts[t]*width/max)\"s\",\"\");
+                    gsub(\" \", \"#\", radek);
+                    print year[t] \": \" radek;
+                }
+                if(countN > 0){
+                    radek=sprintf(\"%\"int(countN*width/max)\"s\",\"\");
+                    gsub(\" \", \"#\", radek);
+                    print \"None: \" radek;
+                }
+            }
+        }'"
+    ;;
+    countries)
+    stacked_logs="$stacked_logs | sort -t, -k8 | awk -F ',' \"-vwidth=\$width}\" \"-vi=0\" '
+        {   
+            if(tmp == \$8){
+                count++;
+            }else{
+                if(tmp != \"\"){
+                    if(tmp !~ /^CZ/){
+                        if(width ~ /^0/){
+                            printf \"%s%s%d\\n\",  tmp,\": \" , count+1;
+                            i++;
+                        }else{
+                            country[i]=tmp
+                            counts[i]=count+1;
+                            i++;
+                        }
+                    }      
+                }
+                tmp = \$8;
+                count = 0
+            }      
+        }END{
+            if(width ~ /^0/){
+                if(tmp !~ /^CZ/){
+                    if(i>0){
+                        printf \"%s%s%d\\n\",  tmp,\": \" , count+1;
+                    }
+                    
+                } 
+            }else{
+                if(tmp !~ /^CZ/ && tmp != \"\"){
+                    country[i]=tmp
+                    counts[i]=count+1;
+                    i++;
+                }
+                if(width ~ /^-1/){
+                    max=100;
+                    width = 1;
+                }else{
+                    max = 0;
+                    for(j = 0; j < i; j++){
+                        if(counts[j]>max){
+                            max = counts[j];
+                        }
+                    }
+                }
+                for(t=0; t < i; t++){
+                    radek=sprintf(\"%\"int(counts[t]*width/max)\"s\",\"\");
+                    gsub(\" \", \"#\", radek);
+                    print country[t] \": \" radek;
+                }
+            }
+        }'"
+    ;;
+    districts)
+    stacked_logs="$stacked_logs | sort -t, -k6 | awk -F ',' \"-vwidth=\$width}\" \"-vi=0\" '
+        {   
+            if(tmp == \$6){
+                count++;
+            }else{
+                if(tmp != \"\"){
+                    if(width ~ /^0/){
+                        printf \"%s%s%d\\n\",  tmp,\": \" , count+1;
+                        i++;
+                    }else{
+                        district[i]=tmp
+                        counts[i]=count+1
+                        i++
+                    }
+                }else{
+                    countN = count
+                }
+                tmp = \$6;
+                count = 0
+            }  
+        }END{
+            if(width ~ /^0/){
+                if(tmp!=\"\"){
+                    printf \"%s%s%d\\n\",  tmp,\": \" , count+1;
+                }else if(i>0){
+                    countN += count+1;
+                }else{
+                    countN +=count;
+                }
+                if(countN > 0){
+                    printf \"%s%d\\n\",  \"None: \" , countN;
+                }
+            }else{
+                if(tmp!=\"\"){
+                    district[i]=tmp
+                    counts[i]=count+1;
+                    i++;
+                }else if(i>0){
+                    countN += count+1;
+                }else{
+                    countN +=count;
+                }
+                if(width ~ /^-1/){
+                    max=1000;
+                    width = 1;
+                }else{
+                    max = 0;
+                    for(j = 0; j < i; j++){
+                        if(counts[j]>max){
+                            max = counts[j];
+                        }
+                    }
+                    if(countN > max){
+                        max = countN;
+                    }
+                }
+                for(t=0; t < i; t++){
+                    radek=sprintf(\"%\"int(counts[t]*width/max)\"s\",\"\");
+                    gsub(\" \", \"#\", radek);
+                    print district[t] \": \" radek;
+                }
+                if(countN > 0){
+                    radek=sprintf(\"%\"int(countN*width/max)\"s\",\"\");
+                    gsub(\" \", \"#\", radek);
+                    print \"None: \" radek;
+                }
+            }
+        }'" 
+    ;;
+    regions)
+    stacked_logs="$stacked_logs | sort -t, -k5 | awk -F ',' \"-vwidth=\$width}\" \"-vi=0\" '
+        {   
+            if(tmp == \$5){
+                count++;
+            }else{
+                if(tmp != \"\"){
+                    if(width ~ /^0/){
+                        printf \"%s%s%d\\n\",  tmp,\": \" , count+1;
+                        i++;
+                    }else{
+                        region[i]=tmp
+                        counts[i]=count+1;
+                        i++;
+                    }
+                }else{
+                    
+                    countN = count
+                }
+                tmp = \$5;
+                count = 0
+            }
+               
+        }END{
+            if(width ~ /^0/){
+                if(tmp!=\"\"){
+                    printf \"%s%s%d\\n\",  tmp,\": \" , count+1;
+                }else if(i>0){
+                    countN += count+1;
+                }else{
+                    countN +=count;
+                }
+                if(countN > 0){
+                    printf \"%s%d\\n\",  \"None: \" , countN;
+                }
+            }else{
+                if(tmp!=\"\"){
+                    region[i]=tmp
+                    counts[i]=count+1;
+                    i++;
+                }else if(i>0){
+                    countN += count+1;
+                }else{
+                    countN +=count;
+                }
+                if(width ~ /^-1/){
+                    max=10000;
+                    width = 1;
+                }else{
+                    max = 0;
+                    for(j = 0; j < i; j++){
+                        if(counts[j]>max){
+                            max = counts[j];
+                        }
+                    }
+                }
+                for(t=0; t < i; t++){
+                    radek=sprintf(\"%\"int(counts[t]*width/max)\"s\",\"\");
+                    gsub(\" \", \"#\", radek);
+                    print region[t] \": \" radek;
+                }
+                if(countN > 0){
+                    radek=sprintf(\"%\"int(countN*width/max)\"s\",\"\");
+                    gsub(\" \", \"#\", radek);
+                    print \"None: \" radek;
+                }
+            }
+        }'"
+    ;;
+esac
+
+if [ -z "$command" -o "$command" == "merge" ]; then
+    echo "$header"
+fi
+eval "$stacked_logs"
